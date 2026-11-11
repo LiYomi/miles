@@ -11,10 +11,19 @@ import time
 from pathlib import Path
 
 from miles.rollout.agentic.rollout_limits import current_scope, rollout_lock, rollout_semaphore
+from miles.utils.retry_utils import NonRetryableError
 
 
 class NeedsKeywordError(Exception):
     """An error that pickles but cannot be rebuilt from its args, like many HTTP client errors."""
+
+    def __init__(self, message: str, *, detail: str):
+        super().__init__(message)
+        self.detail = detail
+
+
+class NeedsKeywordStop(NonRetryableError):
+    """A broken-setup error that pickles but cannot be rebuilt from its args."""
 
     def __init__(self, message: str, *, detail: str):
         super().__init__(message)
@@ -40,6 +49,10 @@ async def fail(**kwargs) -> None:
 
 async def fail_unrebuildably(**kwargs) -> None:
     raise NeedsKeywordError("agent failed on purpose", detail="lost on the way")
+
+
+async def stop_unrebuildably(**kwargs) -> None:
+    raise NeedsKeywordStop("setup broken on purpose", detail="lost on the way")
 
 
 async def exit_without_returning(**kwargs) -> None:

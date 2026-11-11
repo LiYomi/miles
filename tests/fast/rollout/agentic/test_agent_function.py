@@ -13,6 +13,7 @@ import pytest
 from miles.rollout.agentic import agent_function
 from miles.rollout.agentic.agent_function import call_agent_function
 from miles.rollout.agentic.rollout_limits import current_scope
+from miles.utils.retry_utils import NonRetryableError
 from miles.utils.test_utils import agent_function_stubs as stubs
 
 
@@ -67,6 +68,12 @@ def test_subproc_raises_the_agent_error_with_its_traceback():
 def test_an_error_that_cannot_be_rebuilt_arrives_by_name():
     with pytest.raises(RuntimeError, match="NeedsKeywordError: agent failed on purpose"):
         asyncio.run(call_agent_function(stubs.fail_unrebuildably, mode="subproc"))
+
+
+def test_a_stop_that_cannot_be_rebuilt_still_stops_the_rollout():
+    """A NonRetryableError that cannot cross the process boundary as itself must still stop the rollout."""
+    with pytest.raises(NonRetryableError, match="NeedsKeywordStop: setup broken on purpose"):
+        asyncio.run(call_agent_function(stubs.stop_unrebuildably, mode="subproc"))
 
 
 def test_an_agent_process_that_exits_without_returning_fails_the_call():

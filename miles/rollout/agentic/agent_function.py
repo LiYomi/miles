@@ -24,6 +24,7 @@ from typing import Any, BinaryIO, NoReturn
 
 from miles.rollout.agentic import rollout_limits
 from miles.utils.logging_utils import configure_logger_raw
+from miles.utils.retry_utils import NonRetryableError
 
 logger = logging.getLogger(__name__)
 
@@ -285,4 +286,6 @@ def _dump_outcome(outcome: tuple) -> bytes:
         pickle.loads(data)
         return data
     except Exception:
-        return pickle.dumps(("error", RuntimeError(f"{type(error).__qualname__}: {error}"), child_traceback))
+        # the caller stops the rollout on a NonRetryableError
+        stand_in = NonRetryableError if isinstance(error, NonRetryableError) else RuntimeError
+        return pickle.dumps(("error", stand_in(f"{type(error).__qualname__}: {error}"), child_traceback))
