@@ -3,13 +3,13 @@ import torch
 
 pytest.importorskip("torchtitan")
 
-from miles.backends.torchtitan_utils.document_gated_delta import DocumentGatedDeltaInnerAttention  # noqa: E402
+from miles.backends.torchtitan_utils.config import TpuGatedDeltaInnerAttention  # noqa: E402
 
 
-def test_the_inner_attention_runs_convs_gate_and_delta_rule_per_document():
+def test_the_inner_attention_runs_convs_gate_and_delta_rule_per_segment():
     """Packing documents must not change any document's output: each one run alone gives the same rows."""
     torch.manual_seed(0)
-    config = DocumentGatedDeltaInnerAttention.Config()
+    config = TpuGatedDeltaInnerAttention.Config()
     attention = config.build()
     doc_lengths = [5, 70, 3]
     seq_len = sum(doc_lengths)

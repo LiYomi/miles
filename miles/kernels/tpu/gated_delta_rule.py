@@ -1,7 +1,7 @@
-"""Qwen3.5's gated delta-net on packed documents in plain torch, for platforms without attn_gym's CUDA kernels.
+"""Qwen3.5's gated delta-net on packed sequences in plain torch, for platforms without attn_gym's CUDA kernels.
 
-Documents are told apart by `document_ids`, one id per token, which keeps the static shape torch_tpu compiles;
-the CUDA kernels take `cu_seqlens` instead, whose length varies.
+Sequences are told apart by `segment_ids`, one non-decreasing id per token as `flash_attention` takes them, which
+keeps the static shape torch_tpu compiles; the CUDA kernels take `cu_seqlens` instead, whose length varies.
 """
 
 import torch
@@ -10,15 +10,20 @@ from torch._higher_order_ops.scan import scan, scan_op
 from torch._higher_order_ops.utils import redirect_to_mode
 from torch.utils.checkpoint import _CachedTorchDispatchMode, _CachingTorchDispatchMode
 
-# torch registers these selective-checkpoint rules for flex_attention and invoke_subgraph but not for scan, so a
-# remat region around this layer fails on the scan; with them the checkpoint policy saves or recomputes it whole
-for _mode in (_CachingTorchDispatchMode, _CachedTorchDispatchMode):
-    if _mode not in scan_op.python_key_table:
-        redirect_to_mode(scan_op, _mode)
+
+def allow_scan_in_selective_checkpoint() -> None:
+    """Let a selective activation checkpoint save or recompute `gated_delta_rule`'s scan whole.
+
+    torch (2.11 to 2.14) registers these rules for flex_attention and invoke_subgraph, not for scan, so a checkpoint
+    region around this layer fails on the scan; once torch registers them for scan_op this is a no-op and can go.
+    """
+    for mode in (_CachingTorchDispatchMode, _CachedTorchDispatchMode):
+        if mode not in scan_op.python_key_table:
+            redirect_to_mode(scan_op, mode)
 
 
-def document_short_conv(x_TC: torch.Tensor, weight_C1W: torch.Tensor, doc_ids_T: torch.Tensor) -> torch.Tensor:
-    """attn_gym's varlen `causal_conv1d` with silu: a depthwise causal conv that stops at each document start.
+def short_conv(x_TC: torch.Tensor, weight_C1W: torch.Tensor, *, segment_ids: torch.Tensor) -> torch.Tensor:
+    """attn_gym's varlen `causal_conv1d` with silu: a depthwise causal conv that stops at each segment start.
 
     Shift-and-multiply rather than F.conv1d, whose compiled backward XLA rejects (b/574632209).
     """
@@ -27,8 +32,8 @@ def document_short_conv(x_TC: torch.Tensor, weight_C1W: torch.Tensor, doc_ids_T:
     out_TC = x_TC.float() * weight_CW[:, -1]
     for shift in range(1, kernel_size):
         shifted_TC = F.pad(x_TC.float(), (0, 0, shift, 0))[:seq_len]
-        same_doc_T = doc_ids_T == F.pad(doc_ids_T, (shift, 0), value=-1)[:seq_len]
-        out_TC = out_TC + shifted_TC * same_doc_T[:, None] * weight_CW[:, -1 - shift]
+        same_segment_T = segment_ids == F.pad(segment_ids, (shift, 0), value=-1)[:seq_len]
+        out_TC = out_TC + shifted_TC * same_segment_T[:, None] * weight_CW[:, -1 - shift]
     return F.silu(out_TC).to(x_TC.dtype)
 
 
@@ -83,22 +88,20 @@ class _UnitLowerInverse(torch.autograd.Function):
         return (x.mT @ dx @ x.mT).tril(-1)
 
 
-def document_gated_delta(
+def gated_delta_rule(
     q_THK: torch.Tensor,
     k_THK: torch.Tensor,
     v_THV: torch.Tensor,
     g_TH: torch.Tensor,
     beta_TH: torch.Tensor,
-    doc_ids_T: torch.Tensor,
     *,
+    segment_ids: torch.Tensor,
     chunk_size: int = 128,
 ) -> torch.Tensor:
-    """attn_gym's `chunk_gdn` (gated delta rule on l2-normalized q, k; scale K^-0.5) with the state reset per document.
+    """attn_gym's `chunk_gdn` (gated delta rule on l2-normalized q, k; scale K^-0.5) with the state reset per segment.
 
     The chunked form of the recurrence, in fp32. Within a chunk, decays exp(G_i - G_j) are only taken for j <= i
-    of one document, so they never exceed 1; the state crosses chunks in a scan. On one v7x core at Qwen3.5-4B
-    shapes (T=8192), 128-token chunks with the blocked inverse ran fwd+bwd 3.8x faster than row substitution,
-    at 35% less HBM.
+    of one segment, so they never exceed 1; the state crosses chunks in a scan.
     """
     seq_len, num_heads, key_dim = v_THV.shape[0], v_THV.shape[1], q_THK.shape[-1]
     # each query/key head serves a run of consecutive value heads
@@ -116,23 +119,23 @@ def document_gated_delta(
     v = chunked(v_THV)
     beta = chunked(beta_TH)
     g = chunked(g_TH).cumsum(-1)
-    doc = F.pad(doc_ids_T, (0, pad), value=-1).unflatten(0, (-1, chunk_size))  # [N, C]
-    prev_doc = F.pad(doc[:-1, -1], (1, 0), value=-2)  # [N], the document of the token before each chunk
+    seg = F.pad(segment_ids, (0, pad), value=-1).unflatten(0, (-1, chunk_size))  # [N, C]
+    prev_seg = F.pad(seg[:-1, -1], (1, 0), value=-2)  # [N], the segment of the token before each chunk
 
     causal = torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device).tril()
-    in_doc_causal = (doc[:, :, None] == doc[:, None, :]) & causal
-    decay = torch.where(in_doc_causal, g[..., :, None] - g[..., None, :], -torch.inf).exp()
+    in_segment_causal = (seg[:, :, None] == seg[:, None, :]) & causal
+    decay = torch.where(in_segment_causal, g[..., :, None] - g[..., None, :], -torch.inf).exp()
 
-    # (I + A)^-1, A[i, j] = beta_i <k_i, k_j> exp(G_i - G_j) for j < i in one document
+    # (I + A)^-1, A[i, j] = beta_i <k_i, k_j> exp(G_i - G_j) for j < i in one segment
     transform = _UnitLowerInverse.apply(-(k @ k.mT) * decay.tril(-1) * beta[..., None])
     u = transform @ (v * beta[..., None])
     w = transform @ (k * (beta * g.exp())[..., None])
     a_qk = (q @ k.mT) * decay
 
-    # tokens continuing the carried state's document read it; the chunk's last document writes it
-    reads_state = (doc == prev_doc[:, None]).float()[..., None]  # [N, C, 1]
-    writes_state = (doc == doc[:, -1:]).float()[..., None]
-    state_survives = (doc[:, -1] == prev_doc).float()  # [N]
+    # tokens continuing the carried state's segment read it; the chunk's last segment writes it
+    reads_state = (seg == prev_seg[:, None]).float()[..., None]  # [N, C, 1]
+    writes_state = (seg == seg[:, -1:]).float()[..., None]
+    state_survives = (seg[:, -1] == prev_seg).float()  # [N]
     w_from_state = w * reads_state
     q_from_state = q * g.exp()[..., None] * reads_state
     k_to_last_T = (k * (g[..., -1:] - g).exp()[..., None] * writes_state).mT

@@ -10,6 +10,7 @@ from types import ModuleType
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
+import torch.nn.functional as F
 from torchtitan.components.optim import AdamW, LRSchedulersContainer, Optim, OptimizersContainer
 from torchtitan.config import TrainingConfig
 from torchtitan.config.configs import DebugConfig
@@ -29,8 +30,6 @@ from torchtitan.models.common.moe import MoE
 from miles import platforms
 from miles.backends.torchtitan_utils import lora
 from miles.backends.torchtitan_utils.components import TiedCheckpointManager
-from miles.backends.torchtitan_utils.document_attention import document_ids
-from miles.backends.torchtitan_utils.document_gated_delta import DocumentGatedDeltaInnerAttention
 from miles.backends.torchtitan_utils.loss import RLLossAdapter
 from miles.backends.torchtitan_utils.trainer import TitanTrainer
 from miles.utils.args.runtime import TrainerConfig
@@ -87,24 +86,33 @@ def build_model_config(
     return model
 
 
+@dataclass(kw_only=True, slots=True)
+class _SegmentIdsConfig(InnerAttention.Config):
+    """The metadata of the inner attentions on miles.kernels.tpu: each token's segment id."""
+
+    def build_attention_metadata(
+        self,
+        positions: torch.Tensor,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        max_num_documents: int | None = None,
+        max_context_length: int | None = None,
+    ) -> torch.Tensor:
+        # positions restart at 0 in every sequence and the padding tail, so each token's segment is the index of
+        # its sequence's first token; no cumsum: with the scan emitter off, torch_tpu cannot lower an int64 cumsum
+        return torch.arange(positions.shape[-1], device=positions.device, dtype=torch.int32) - positions.to(
+            torch.int32
+        )
+
+
 class TpuFlashInnerAttention(InnerAttention):
     """torchtitan's inner attention on miles.kernels.tpu; its metadata is each token's segment id."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(InnerAttention.Config):
+    class Config(_SegmentIdsConfig):
         @property
         def is_full_attention(self) -> bool:
             return True
-
-        def build_attention_metadata(
-            self,
-            positions: torch.Tensor,
-            *,
-            padding_mask: torch.Tensor | None = None,
-            max_num_documents: int | None = None,
-            max_context_length: int | None = None,
-        ) -> torch.Tensor:
-            return document_ids(positions)
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -185,11 +193,61 @@ def _check_heads_divide_across_cp(model: BaseModel.Config, *, cp: int, tp: int) 
                 )
 
 
+class TpuGatedDeltaInnerAttention(InnerAttention):
+    """torchtitan's `InnerGDN` (short convs, decay gate, delta rule) on miles.kernels.tpu, without attn_gym."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(_SegmentIdsConfig):
+        pass
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        # imported and registered here, like flash_attention: torch's scan dispatch is only patched for a model
+        # that has these layers
+        from miles.kernels.tpu.gated_delta_rule import allow_scan_in_selective_checkpoint, gated_delta_rule, short_conv
+
+        allow_scan_in_selective_checkpoint()
+        self.gated_delta_rule = gated_delta_rule
+        self.short_conv = short_conv
+
+    def forward(
+        self,
+        query_TC: torch.Tensor,
+        key_TC: torch.Tensor,
+        value_TC: torch.Tensor,
+        a_TH: torch.Tensor,
+        b_TH: torch.Tensor,
+        conv_q_weight_C1W: torch.Tensor,
+        conv_k_weight_C1W: torch.Tensor,
+        conv_v_weight_C1W: torch.Tensor,
+        A_log_H: torch.Tensor,
+        dt_bias_H: torch.Tensor,
+        *,
+        key_head_dim: int,
+        value_head_dim: int,
+        attention_metadata: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = query_TC.shape[0]
+
+        def conv_heads(x_TC: torch.Tensor, weight_C1W: torch.Tensor, head_dim: int) -> torch.Tensor:
+            return self.short_conv(x_TC, weight_C1W, segment_ids=attention_metadata).reshape(num_tokens, -1, head_dim)
+
+        g_TH = -torch.exp(A_log_H.float()) * F.softplus(a_TH.float() + dt_bias_H)
+        return self.gated_delta_rule(
+            conv_heads(query_TC, conv_q_weight_C1W, key_head_dim),
+            conv_heads(key_TC, conv_k_weight_C1W, key_head_dim),
+            conv_heads(value_TC, conv_v_weight_C1W, value_head_dim),
+            g_TH,
+            torch.sigmoid(b_TH),
+            segment_ids=attention_metadata,
+        )
+
+
 def _replace_inner_attention(model: BaseModel.Config) -> None:
-    """Swap in inner attentions keyed on document ids, for platforms without sparse FlexAttention or attn_gym."""
+    """Swap in inner attentions keyed on segment ids, for platforms without sparse FlexAttention or attn_gym."""
     replacements: dict[type[InnerAttention.Config], type[InnerAttention.Config]] = {
         FlexInnerAttention.Config: TpuFlashInnerAttention.Config,
-        InnerGDN.Config: DocumentGatedDeltaInnerAttention.Config,
+        InnerGDN.Config: TpuGatedDeltaInnerAttention.Config,
     }
     for layer in model.layers:
         for _, inner, parent, field_name in layer.traverse(InnerAttention.Config, recurse=True):

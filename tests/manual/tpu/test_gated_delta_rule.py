@@ -1,6 +1,6 @@
-"""Compiled document GDN and short convolution against their CPU references on a real TPU.
+"""Compiled gated delta rule and short convolution against their CPU references on a real TPU.
 
-Run on a TPU host: python -m pytest tests/manual/tpu/test_gated_delta.py
+Run on a TPU host: python -m pytest tests/manual/tpu/test_gated_delta_rule.py
 """
 
 import functools
@@ -13,10 +13,17 @@ torch_tpu = pytest.importorskip("torch_tpu")
 
 from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts  # noqa: E402
 
-from miles.backends.torchtitan_utils.document_attention import document_ids  # noqa: E402
-from miles.kernels.tpu.gated_delta import document_gated_delta, document_short_conv  # noqa: E402
+from miles.kernels.tpu.gated_delta_rule import (  # noqa: E402
+    allow_scan_in_selective_checkpoint,
+    gated_delta_rule,
+    short_conv,
+)
 
 _DOC_LENGTHS = [1, 7, 8, 13, 3, 20, 5]
+
+
+def _segment_ids() -> torch.Tensor:
+    return torch.repeat_interleave(torch.arange(len(_DOC_LENGTHS), dtype=torch.int32), torch.tensor(_DOC_LENGTHS))
 
 
 def _inputs():
@@ -26,23 +33,23 @@ def _inputs():
     v = torch.randn(seq_len, 4, 8, requires_grad=True)
     g = (-F.softplus(torch.randn(seq_len, 4))).requires_grad_()
     beta = torch.rand(seq_len, 4, requires_grad=True)
-    positions = torch.cat([torch.arange(length) for length in _DOC_LENGTHS])
-    return (q, k, v, g, beta), document_ids(positions)
+    return q, k, v, g, beta
 
 
 @pytest.mark.parametrize("chunk_size", [16, 128])
 def test_compiled_selective_checkpoint_matches_cpu(chunk_size):
     """Chunk 16 regresses TorchTPU's reverse scan; chunk 128 is the production default."""
+    allow_scan_in_selective_checkpoint()
     torch.set_float32_matmul_precision("highest")
-    inputs, ids = _inputs()
-    expected = document_gated_delta(*inputs, ids, chunk_size=chunk_size)
+    inputs, ids = _inputs(), _segment_ids()
+    expected = gated_delta_rule(*inputs, segment_ids=ids, chunk_size=chunk_size)
     grad = torch.randn_like(expected)
     expected_grads = torch.autograd.grad(expected, inputs, grad)
 
     tpu_ids = ids.to("tpu")
 
     def kernel(*xs):
-        return document_gated_delta(*xs, tpu_ids, chunk_size=chunk_size)
+        return gated_delta_rule(*xs, segment_ids=tpu_ids, chunk_size=chunk_size)
 
     def recompute_everything(ctx, op, *args, **kwargs):
         return CheckpointPolicy.PREFER_RECOMPUTE
@@ -68,16 +75,15 @@ def test_compiled_short_conv_matches_cpu():
     seq_len = sum(_DOC_LENGTHS)
     x = torch.randn(seq_len, 6, requires_grad=True)
     weight = torch.randn(6, 1, 4, requires_grad=True)
-    positions = torch.cat([torch.arange(length) for length in _DOC_LENGTHS])
-    ids = document_ids(positions)
-    expected = document_short_conv(x, weight, ids)
+    ids = _segment_ids()
+    expected = short_conv(x, weight, segment_ids=ids)
     grad = torch.randn_like(expected)
     expected_grads = torch.autograd.grad(expected, (x, weight), grad)
 
     tpu_x = x.detach().to("tpu").requires_grad_()
     tpu_weight = weight.detach().to("tpu").requires_grad_()
-    compiled = torch.compile(document_short_conv, backend="tpu", fullgraph=True, dynamic=False)
-    actual = compiled(tpu_x, tpu_weight, ids.to("tpu"))
+    compiled = torch.compile(short_conv, backend="tpu", fullgraph=True, dynamic=False)
+    actual = compiled(tpu_x, tpu_weight, segment_ids=ids.to("tpu"))
     actual_grads = torch.autograd.grad(actual, (tpu_x, tpu_weight), grad.to("tpu"))
 
     torch.testing.assert_close(actual.cpu(), expected, atol=3e-3, rtol=3e-3)

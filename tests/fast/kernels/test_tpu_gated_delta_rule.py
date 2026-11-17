@@ -4,15 +4,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from miles.backends.torchtitan_utils.document_attention import document_ids
-from miles.kernels.tpu.gated_delta import document_gated_delta, document_short_conv
+from miles.kernels.tpu.gated_delta_rule import allow_scan_in_selective_checkpoint, gated_delta_rule, short_conv
 
 # documents shorter than, as long as and longer than the 4-wide kernel, one token long, and a padding tail
 _DOC_LENGTHS = [1, 3, 4, 9, 2, 5]
 
 
-def _positions(doc_lengths: list[int]) -> torch.Tensor:
-    return torch.cat([torch.arange(n) for n in doc_lengths])
+def _segment_ids(doc_lengths: list[int]) -> torch.Tensor:
+    return torch.repeat_interleave(torch.arange(len(doc_lengths), dtype=torch.int32), torch.tensor(doc_lengths))
 
 
 def _per_document_conv(x_TC: torch.Tensor, weight_C1W: torch.Tensor, doc_lengths: list[int]) -> torch.Tensor:
@@ -29,7 +28,7 @@ def test_short_conv_matches_conv1d_run_on_each_document(doc_lengths):
     x = torch.randn(sum(doc_lengths), 6, dtype=torch.float32, requires_grad=True)
     weight = torch.randn(6, 1, 4, dtype=torch.float32, requires_grad=True)
 
-    out = document_short_conv(x, weight, document_ids(_positions(doc_lengths)))
+    out = short_conv(x, weight, segment_ids=_segment_ids(doc_lengths))
     expected = _per_document_conv(x, weight, doc_lengths)
     torch.testing.assert_close(out, expected)
 
@@ -41,7 +40,7 @@ def test_short_conv_matches_conv1d_run_on_each_document(doc_lengths):
 
 def test_short_conv_keeps_the_input_dtype():
     x = torch.randn(8, 4, dtype=torch.bfloat16)
-    out = document_short_conv(x, torch.randn(4, 1, 4, dtype=torch.bfloat16), document_ids(torch.arange(8)))
+    out = short_conv(x, torch.randn(4, 1, 4, dtype=torch.bfloat16), segment_ids=_segment_ids([8]))
     assert out.dtype == torch.bfloat16
 
 
@@ -81,7 +80,7 @@ def test_chunked_delta_rule_matches_the_recurrence_run_on_each_document(num_key_
     beta = torch.rand(seq_len, 4, requires_grad=True)
     inputs = (q, k, v, g, beta)
 
-    out = document_gated_delta(*inputs, document_ids(_positions(_CHUNKED_DOC_LENGTHS)), chunk_size=chunk_size)
+    out = gated_delta_rule(*inputs, segment_ids=_segment_ids(_CHUNKED_DOC_LENGTHS), chunk_size=chunk_size)
     expected = _per_document_gated_delta(*inputs, _CHUNKED_DOC_LENGTHS)
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-4)
 
@@ -100,7 +99,7 @@ def test_chunk128_matches_recurrence_across_multiple_chunks():
     beta = torch.rand(seq_len, 4, requires_grad=True)
     inputs = (q, k, v, g, beta)
 
-    out = document_gated_delta(*inputs, document_ids(_positions(doc_lengths)), chunk_size=128)
+    out = gated_delta_rule(*inputs, segment_ids=_segment_ids(doc_lengths), chunk_size=128)
     expected = _per_document_gated_delta(*inputs, doc_lengths)
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-4)
 
@@ -119,7 +118,7 @@ def test_chunked_delta_rule_matches_recurrence_at_decay_limits(decay):
     beta = torch.rand(seq_len, 4, requires_grad=True)
     inputs = (q, k, v, g, beta)
 
-    out = document_gated_delta(*inputs, document_ids(_positions(_CHUNKED_DOC_LENGTHS)), chunk_size=16)
+    out = gated_delta_rule(*inputs, segment_ids=_segment_ids(_CHUNKED_DOC_LENGTHS), chunk_size=16)
     expected = _per_document_gated_delta(*inputs, _CHUNKED_DOC_LENGTHS)
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-4)
 
@@ -133,6 +132,7 @@ def test_chunked_delta_rule_runs_under_selective_activation_checkpointing(compil
     """Selective checkpointing handles scan's dispatch and never asks AOT to cut through a differentiated scan."""
     from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
+    allow_scan_in_selective_checkpoint()
     torch.manual_seed(0)
     seq_len = sum(_CHUNKED_DOC_LENGTHS)
     q, k = (torch.randn(seq_len, 2, 16, requires_grad=True) for _ in range(2))
@@ -140,10 +140,10 @@ def test_chunked_delta_rule_runs_under_selective_activation_checkpointing(compil
     g = (-F.softplus(torch.randn(seq_len, 4))).requires_grad_()
     beta = torch.rand(seq_len, 4, requires_grad=True)
     inputs = (q, k, v, g, beta)
-    ids = document_ids(_positions(_CHUNKED_DOC_LENGTHS))
+    ids = _segment_ids(_CHUNKED_DOC_LENGTHS)
 
     def run(*xs):
-        return document_gated_delta(*xs, ids, chunk_size=16)
+        return gated_delta_rule(*xs, segment_ids=ids, chunk_size=16)
 
     expected = run(*inputs)
 
