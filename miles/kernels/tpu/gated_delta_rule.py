@@ -145,6 +145,15 @@ def gated_delta_rule(
     return out_HNCV.flatten(1, 2).movedim(0, 1)[:seq_len].to(v_THV.dtype)
 
 
+def _chunk(x_HN: torch.Tensor, index: int) -> torch.Tensor:
+    """Chunk `index` of x [H, N, ...] as a tensor of its own.
+
+    A slice (x[:, index]) is a view, which the partitioner hands to the compiled backward as such, and torch_tpu
+    materializes a view input by copying its base from the view's offset to the end: over N chunks, O(N^2) memory.
+    """
+    return x_HN.index_select(1, x_HN.new_full((1,), index, dtype=torch.long)).squeeze(1)
+
+
 class _ChunkRecurrence(torch.autograd.Function):
     """The state carried across chunks, as one loop each way.
 
@@ -192,7 +201,7 @@ class _ChunkRecurrence(torch.autograd.Function):
         d_state = d_out.new_zeros(states.shape[0], *states.shape[2:])
         grads = [[] for _ in range(6)]
         for index in range(states.shape[1] - 1, -1, -1):
-            d_state, step_grads = step(d_state, tuple(x[:, index] for x in (*saved, d_out)))
+            d_state, step_grads = step(d_state, tuple(_chunk(x, index) for x in (*saved, d_out)))
             for parts, grad in zip(grads, step_grads, strict=True):
                 parts.append(grad)
         return tuple(torch.stack(list(reversed(parts)), dim=1) for parts in grads)
