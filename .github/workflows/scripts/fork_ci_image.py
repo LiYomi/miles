@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # doc-dev: docs/developer/ci/02-docker-build.md
-"""Validate image requests and orchestrate builds with default-branch code.
-
-CUDA forks use docker-build; all ROCm PR builds use Spur compute nodes.
+"""Validate a fork image request for default-branch build orchestration.
 
 Fork driver code is never executed. Literal variant build_args edits are accepted
 against the frozen merge base; ROCm builds use only rocm10-mi35x arguments.
@@ -112,9 +110,7 @@ def validate_identity(request, run, pr, repository, workflow_id):
     require(pr["number"] == request["pr"] and pr["state"] == "open", "PR is no longer open")
     require(pr["base"]["repo"]["full_name"] == repository, "Wrong PR base repository")
     head = pr["head"]
-    require(head["repo"], "PR head repository was deleted")
-    if variant(request) == "cu13":
-        require(head["repo"]["id"] != pr["base"]["repo"]["id"], "Expected a fork PR")
+    require(head["repo"] and head["repo"]["id"] != pr["base"]["repo"]["id"], "Expected a fork PR")
     require(head["repo"]["id"] == run["head_repository"]["id"], "Wrong fork repository")
     require(head["sha"] == run["head_sha"] and head["ref"] == run["head_branch"], "PR head moved")
     # Reruns keep the original merge SHA even when main has advanced.
@@ -339,25 +335,7 @@ def build_command(request, source):
 def build_image(request, repository, source):
     require_active_source(request, repository)
     command = build_command(request, source)
-    if variant(request) == "rocm10-mi35x-pr":
-        command = [
-            sys.executable,
-            str(ROOT / ".github/workflows/scripts/spur/build_image.py"),
-            "launch",
-            "--source",
-            str(source),
-            "--merge-sha",
-            request["merge_sha"],
-            "--inputs-hash",
-            request["inputs_hash"],
-            "--command",
-            json.dumps(command),
-        ]
-    build_env = dict(os.environ)
-    # Newer main supports forwarding this as a BuildKit secret. PR Dockerfiles
-    # must remain anonymous even if the login runner happens to define it.
-    build_env.pop("BUILD_GITHUB_TOKEN", None)
-    process = subprocess.Popen(command, start_new_session=True, env=build_env)
+    process = subprocess.Popen(command, start_new_session=True)
     try:
         while True:
             try:

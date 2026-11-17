@@ -17,7 +17,7 @@ name: PR Test (ROCm)
 # PR jobs use the same low-trust `pull_request` model as pr-test.yml: checkout
 # tests the merge commit, and GitHub withholds repository secrets from forks.
 # Changed ROCm image inputs build or reuse a PR image independently of test
-# selection, through the trusted publisher and Spur compute nodes.
+# selection, on the same docker-build builders as CUDA.
 #
 # Dependency refs use the CUDA resolver. Each nonempty shard checks the
 # requested refs or release lock, then tracks sglang-miles / miles-main.

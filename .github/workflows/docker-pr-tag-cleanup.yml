@@ -16,8 +16,8 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository)
-    # Explicit credential exception: closed ROCm tags use the same trusted
-    # hosted cleanup and Docker Hub secret as TPU. Publication stays on Spur.
+    # A closed fork PR deletes only its ROCm tag, with the same hosted job and
+    # Docker Hub secret as same-repository PRs.
     runs-on: ubuntu-latest
     steps:
       - shell: bash

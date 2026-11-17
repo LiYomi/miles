@@ -585,11 +585,14 @@ def test_workflow_preserves_gate_and_build_publish_boundary():
     assert "steps.wait.outputs.built" in image_job["outputs"]["built"]
     assert "steps.wait.outputs.built == 'true'" in image_job["outputs"]["tag_available"]
     assert parent["jobs"]["docker-build"]["permissions"]["actions"] == "read"
+    # Both recipes share builders: same-repository PRs build in place, forks hand off.
+    assert "variant" not in image_job["env"]["BUILD"] + image_job["env"]["REQUEST_BUILD"]
     wait = next(step for step in image_job["steps"] if step.get("id") == "wait")
     assert "wait-build" in wait["run"] and 'echo "built=true"' in wait["run"]
     workflow = yaml.safe_load((ROOT / ".github/workflows/build-fork-ci-image.yml").read_text())
     assert workflow[True]["workflow_run"]["types"] == ["in_progress"]
     assert workflow["jobs"]["build"]["permissions"]["actions"] == "read"
+    assert workflow["jobs"]["build"]["runs-on"] == ["docker-build"]
     assert workflow["jobs"]["build"]["concurrency"]["cancel-in-progress"] is True
     steps = workflow["jobs"]["build"]["steps"]
     cleanup = next(
@@ -627,6 +630,11 @@ def test_rocm_request_is_bound_to_the_rocm_workflow(identity):
     request["variant"] = "arbitrary-build-recipe"
     with pytest.raises(ValueError, match="Invalid variant"):
         HANDLER.parse_request(archive_request(request))
+    # Same-repository ROCm PRs build in _build-pr-ci-image.yml, as CUDA does.
+    request["variant"] = "rocm10-mi35x-pr"
+    run["head_repository"] = pr["head"]["repo"] = pr["base"]["repo"]
+    with pytest.raises(ValueError, match="Expected a fork PR"):
+        HANDLER.validate_identity(request, run, pr, REPOSITORY, 99)
 
 
 @pytest.mark.parametrize("labels", [[], ["run-ci"], ["run-ci-amd"]])
